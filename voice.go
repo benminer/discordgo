@@ -644,9 +644,24 @@ func (v *VoiceConnection) udpOpen() (err error) {
 	// Grab port from position 72 and 73
 	port := binary.BigEndian.Uint16(rb[len(rb)-2:])
 
+	// Negotiate encryption mode from available modes
+	// Prefer modern modes over deprecated xsalsa20_poly1305
+	encryptionMode := "xsalsa20_poly1305" // fallback for older Discord servers
+	for _, mode := range v.op2.Modes {
+		switch mode {
+		case "aead_aes256_gcm_rtpsize":
+			encryptionMode = mode
+			goto encryptionModeSelected
+		case "aead_xchacha20_poly1305_rtpsize":
+			encryptionMode = mode
+			// Continue looking for preferred aead_aes256_gcm_rtpsize
+		}
+	}
+encryptionModeSelected:
+
 	// Take the data from above and send it back to Discord to finalize
 	// the UDP connection handshake.
-	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, "xsalsa20_poly1305"}}}
+	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, encryptionMode}}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
