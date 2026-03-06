@@ -75,6 +75,10 @@ type VoiceConnection struct {
 	// daveEncryptBuf is a reusable buffer for DAVE frame encryption
 	daveEncryptBuf []byte
 
+	// lastSeq tracks the last received sequence number from the voice gateway.
+	// Used in v8 heartbeats to echo back seq_ack.
+	lastSeq int64
+
 	op4 voiceOP4
 	op2 voiceOP2
 
@@ -323,7 +327,7 @@ func (v *VoiceConnection) open() (err error) {
 	}
 
 	// Connect to VoiceConnection Websocket
-	vg := "wss://" + strings.TrimSuffix(v.endpoint, ":80")
+	vg := "wss://" + strings.TrimSuffix(v.endpoint, ":80") + "?v=8"
 	v.log(LogInformational, "connecting to voice endpoint %s", vg)
 	v.wsConn, _, err = v.session.Dialer.Dial(vg, nil)
 	if err != nil {
@@ -332,6 +336,17 @@ func (v *VoiceConnection) open() (err error) {
 		return
 	}
 
+	// In Voice Gateway v8, we wait for OP8 Hello before sending OP0 Identify.
+	// The wsListen goroutine will receive OP8 Hello which triggers sendIdentify().
+	v.close = make(chan struct{})
+	go v.wsListen(v.wsConn, v.close)
+
+	return
+}
+
+// sendIdentify sends the OP0 Identify to the voice gateway.
+// In v8, this is called after receiving OP8 Hello.
+func (v *VoiceConnection) sendIdentify() error {
 	type voiceHandshakeData struct {
 		ServerID               string `json:"server_id"`
 		UserID                 string `json:"user_id"`
@@ -352,21 +367,15 @@ func (v *VoiceConnection) open() (err error) {
 	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token, maxDaveVersion}}
 
 	v.wsMutex.Lock()
-	err = v.wsConn.WriteJSON(data)
+	err := v.wsConn.WriteJSON(data)
 	v.wsMutex.Unlock()
 	if err != nil {
-		v.log(LogWarning, "error sending init packet, %s", err)
-		return
+		v.log(LogWarning, "error sending identify packet, %s", err)
+		return err
 	}
 
-	v.close = make(chan struct{})
-	go v.wsListen(v.wsConn, v.close)
-
-	// add loop/check for Ready bool here?
-	// then return false if not ready?
-	// but then wsListen will also err.
-
-	return
+	v.log(LogInformational, "sent OP0 Identify to voice gateway")
+	return nil
 }
 
 // wsListen listens on the voice websocket for messages and passes them
@@ -458,6 +467,13 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		return
 	}
 
+	// Track sequence numbers for v8 heartbeat seq_ack
+	if e.Sequence > 0 {
+		v.Lock()
+		v.lastSeq = e.Sequence
+		v.Unlock()
+	}
+
 	switch e.Operation {
 
 	case 2: // READY
@@ -472,9 +488,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			v.DaveSession.AssignSsrcToCodec(v.op2.SSRC, 1) // 1 = Opus
 		}
 
-		// Start the voice websocket heartbeat to keep the connection alive
-		go v.wsHeartbeat(v.wsConn, v.close, v.op2.HeartbeatInterval)
-		// TODO monitor a chan/bool to verify this was successful
+		// In v8, heartbeat is started from OP8 Hello, not OP2 Ready.
 
 		// Start the UDP connection
 		err := v.udpOpen()
@@ -484,8 +498,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 
 		// Start the opusSender.
-		// TODO: Should we allow 48000/960 values to be user defined?
-		// answer: no, 48k is required as per discord documentaiton and 960 is the most optimal frame size (based on testing)
+		// 48k is required as per discord documentation and 960 is the most optimal frame size (based on testing)
 		if v.OpusSend == nil {
 			v.OpusSend = make(chan []byte, 100)
 		}
@@ -502,9 +515,8 @@ func (v *VoiceConnection) onEvent(message []byte) {
 
 		return
 
-	case 3: // HEARTBEAT response
-		// add code to use this to track latency?
-		// TODO: maybe actually implement this, seems cool
+	case 6: // HEARTBEAT_ACK (v8)
+		// Can be used to track latency in the future.
 		return
 
 	case 4: // udp encryption secret key (SessionDescription)
@@ -573,6 +585,26 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			}
 		}
 
+	case 8: // HELLO (v8) — first message from server, contains heartbeat_interval
+		var hello struct {
+			HeartbeatInterval float64 `json:"heartbeat_interval"`
+		}
+		if err := json.Unmarshal(e.RawData, &hello); err != nil {
+			v.log(LogError, "OP8 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+
+		v.log(LogInformational, "received OP8 Hello, heartbeat_interval=%.0fms", hello.HeartbeatInterval)
+
+		// Start the heartbeat using the interval from OP8 Hello
+		go v.wsHeartbeat(v.wsConn, v.close, time.Duration(hello.HeartbeatInterval))
+
+		// Now send OP0 Identify (in v8, Identify is sent after Hello)
+		if err := v.sendIdentify(); err != nil {
+			v.log(LogError, "failed to send identify after OP8 Hello, %s", err)
+			return
+		}
+
 	case voiceOpDavePrepareTransition, voiceOpDaveExecuteTransition, voiceOpDavePrepareEpoch:
 		// JSON-encoded DAVE opcodes (21, 22, 24)
 		v.onDaveTextEvent(e.Operation, e.RawData)
@@ -584,9 +616,15 @@ func (v *VoiceConnection) onEvent(message []byte) {
 	return
 }
 
+// voiceHeartbeatOp is the v8 heartbeat format with sequence acknowledgement.
 type voiceHeartbeatOp struct {
-	Op   int `json:"op"` // Always 3
-	Data int `json:"d"`
+	Op   int                `json:"op"` // Always 3
+	Data voiceHeartbeatData `json:"d"`
+}
+
+type voiceHeartbeatData struct {
+	T      int64 `json:"t"`
+	SeqAck int64 `json:"seq_ack"`
 }
 
 // NOTE :: When a guild voice server changes how do we shut this down
@@ -605,9 +643,16 @@ func (v *VoiceConnection) wsHeartbeat(wsConn *websocket.Conn, close <-chan struc
 	ticker := time.NewTicker(i * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		v.log(LogDebug, "sending heartbeat packet")
+		v.RLock()
+		seq := v.lastSeq
+		v.RUnlock()
+
+		v.log(LogDebug, "sending heartbeat packet (seq_ack=%d)", seq)
 		v.wsMutex.Lock()
-		err = wsConn.WriteJSON(voiceHeartbeatOp{3, int(time.Now().Unix())})
+		err = wsConn.WriteJSON(voiceHeartbeatOp{3, voiceHeartbeatData{
+			T:      time.Now().UnixMilli(),
+			SeqAck: seq,
+		}})
 		v.wsMutex.Unlock()
 		if err != nil {
 			v.log(LogError, "error sending heartbeat to voice endpoint %s, %s", v.endpoint, err)
