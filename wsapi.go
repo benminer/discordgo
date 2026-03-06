@@ -739,6 +739,11 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	voice.deaf = deaf
 	voice.mute = mute
 	voice.session = s
+	// Create or recreate DAVE E2EE session if factory is configured.
+	// Always create a fresh session since MLS state is per-connection.
+	if s.DaveSessionCreate != nil {
+		voice.DaveSession = s.DaveSessionCreate(s.State.User.ID, voice)
+	}
 	voice.Unlock()
 
 	err = s.ChannelVoiceJoinManual(gID, cID, mute, deaf)

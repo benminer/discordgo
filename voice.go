@@ -10,6 +10,8 @@
 package discordgo
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -20,7 +22,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/nacl/secretbox"
 )
 
 // ------------------------------------------------------------------------------------------------
@@ -42,6 +43,11 @@ type VoiceConnection struct {
 	speaking     bool
 	reconnecting bool // If true, voice connection is trying to reconnect
 
+	// DaveSession is the DAVE E2EE session for this voice connection.
+	// Set via Session.DaveSessionCreate before voice connection opens.
+	// If nil, DAVE is not used (will fail on Discord servers requiring E2EE).
+	DaveSession DaveSession
+
 	OpusSend chan []byte  // Chan for sending opus audio
 	OpusRecv chan *Packet // Chan for receiving opus audio
 
@@ -62,6 +68,12 @@ type VoiceConnection struct {
 
 	// Used to pass the sessionid from onVoiceStateUpdate
 	// sessionRecv chan string UNUSED ATM
+
+	aead         cipher.AEAD
+	nonceCounter uint32
+
+	// daveEncryptBuf is a reusable buffer for DAVE frame encryption
+	daveEncryptBuf []byte
 
 	op4 voiceOP4
 	op2 voiceOP2
@@ -316,16 +328,23 @@ func (v *VoiceConnection) open() (err error) {
 	}
 
 	type voiceHandshakeData struct {
-		ServerID  string `json:"server_id"`
-		UserID    string `json:"user_id"`
-		SessionID string `json:"session_id"`
-		Token     string `json:"token"`
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDaveProtocolVersion int    `json:"max_dave_protocol_version"`
 	}
 	type voiceHandshakeOp struct {
 		Op   int                `json:"op"` // Always 0
 		Data voiceHandshakeData `json:"d"`
 	}
-	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token}}
+
+	maxDaveVersion := 0
+	if v.DaveSession != nil {
+		maxDaveVersion = v.DaveSession.MaxSupportedProtocolVersion()
+		v.log(LogInformational, "DAVE E2EE enabled, max_dave_protocol_version=%d", maxDaveVersion)
+	}
+	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token, maxDaveVersion}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -352,7 +371,7 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 	v.log(LogInformational, "called")
 
 	for {
-		_, message, err := v.wsConn.ReadMessage()
+		messageType, message, err := v.wsConn.ReadMessage()
 		if err != nil {
 			// 4014 indicates a manual disconnection by someone in the guild;
 			// we shouldn't reconnect.
@@ -400,7 +419,7 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 			v.RUnlock()
 			if sameConnection {
 
-				v.log(LogError, "voice endpoint %s websocket closed unexpectantly, %s", v.endpoint, err)
+				v.log(LogError, "voice endpoint %s websocket closed unexpectedly, %s", v.endpoint, err)
 
 				// Start reconnect goroutine then exit.
 				go v.reconnect()
@@ -413,7 +432,11 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 		case <-close:
 			return
 		default:
-			go v.onEvent(message)
+			if messageType == websocket.BinaryMessage {
+				go v.onDaveBinaryEvent(message)
+			} else {
+				go v.onEvent(message)
+			}
 		}
 	}
 }
@@ -439,6 +462,11 @@ func (v *VoiceConnection) onEvent(message []byte) {
 			return
 		}
 
+		// Register SSRC with DAVE session for Opus codec
+		if v.DaveSession != nil {
+			v.DaveSession.AssignSsrcToCodec(v.op2.SSRC, 1) // 1 = Opus
+		}
+
 		// Start the voice websocket heartbeat to keep the connection alive
 		go v.wsHeartbeat(v.wsConn, v.close, v.op2.HeartbeatInterval)
 		// TODO monitor a chan/bool to verify this was successful
@@ -452,6 +480,7 @@ func (v *VoiceConnection) onEvent(message []byte) {
 
 		// Start the opusSender.
 		// TODO: Should we allow 48000/960 values to be user defined?
+		// answer: no, 48k is required as per discord documentaiton and 960 is the most optimal frame size (based on testing)
 		if v.OpusSend == nil {
 			v.OpusSend = make(chan []byte, 2)
 		}
@@ -470,17 +499,36 @@ func (v *VoiceConnection) onEvent(message []byte) {
 
 	case 3: // HEARTBEAT response
 		// add code to use this to track latency?
+		// TODO: maybe actually implement this, seems cool
 		return
 
-	case 4: // udp encryption secret key
+	case 4: // udp encryption secret key (SessionDescription)
 		v.Lock()
-		defer v.Unlock()
 
 		v.op4 = voiceOP4{}
 		if err := json.Unmarshal(e.RawData, &v.op4); err != nil {
 			v.log(LogError, "OP4 unmarshall error, %s, %s", err, string(e.RawData))
+			v.Unlock()
 			return
 		}
+
+		// TODO: error handling? meh
+		block, _ := aes.NewCipher(v.op4.SecretKey[:])
+		v.aead, _ = cipher.NewGCM(block)
+
+		v.Unlock()
+
+		// Notify DAVE session of the protocol version from SessionDescription
+		if v.DaveSession != nil {
+			var sessionDesc struct {
+				DaveProtocolVersion int `json:"dave_protocol_version"`
+			}
+			if err := json.Unmarshal(e.RawData, &sessionDesc); err == nil {
+				v.log(LogInformational, "DAVE protocol version from server: %d", sessionDesc.DaveProtocolVersion)
+				v.DaveSession.OnSelectProtocolAck(uint16(sessionDesc.DaveProtocolVersion))
+			}
+		}
+
 		return
 
 	case 5:
@@ -497,6 +545,32 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+
+	case 11: // CLIENTS_CONNECT
+		if v.DaveSession != nil {
+			var d struct {
+				UserIDs []string `json:"user_ids"`
+			}
+			if err := json.Unmarshal(e.RawData, &d); err == nil {
+				for _, uid := range d.UserIDs {
+					v.DaveSession.AddUser(uid)
+				}
+			}
+		}
+
+	case 13: // CLIENT_DISCONNECT
+		if v.DaveSession != nil {
+			var d struct {
+				UserID string `json:"user_id"`
+			}
+			if err := json.Unmarshal(e.RawData, &d); err == nil {
+				v.DaveSession.RemoveUser(d.UserID)
+			}
+		}
+
+	case voiceOpDavePrepareTransition, voiceOpDaveExecuteTransition, voiceOpDavePrepareEpoch:
+		// JSON-encoded DAVE opcodes (21, 22, 24)
+		v.onDaveTextEvent(e.Operation, e.RawData)
 
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
@@ -616,7 +690,7 @@ func (v *VoiceConnection) udpOpen() (err error) {
 		return
 	}
 
-	// Create a 74 byte array and listen for the initial handshake response
+	// Create a 74-byte array and listen for the initial handshake response
 	// from Discord.  Once we get it parse the IP and PORT information out
 	// of the response.  This should be our public IP and PORT as Discord
 	// saw us.
@@ -646,7 +720,9 @@ func (v *VoiceConnection) udpOpen() (err error) {
 
 	// Take the data from above and send it back to Discord to finalize
 	// the UDP connection handshake.
-	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, "xsalsa20_poly1305"}}}
+
+	// AEAD AES256-GCM (RTP Size)	aead_aes256_gcm_rtpsize	32-bit incremental integer value, appended to payload	Available (Preferred)
+	data := voiceUDPOp{1, voiceUDPD{"udp", voiceUDPData{ip, port, "aead_aes256_gcm_rtpsize"}}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -707,7 +783,7 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 	}
 
 	// VoiceConnection is now ready to receive audio packets
-	// TODO: this needs reviewed as I think there must be a better way.
+	// TODO: this needs reviewing as I think there must be a better way.
 	v.Lock()
 	v.Ready = true
 	v.Unlock()
@@ -722,7 +798,7 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 	var recvbuf []byte
 	var ok bool
 	udpHeader := make([]byte, 12)
-	var nonce [24]byte
+	nonce := make([]byte, 12)
 
 	// build the parts that don't change in the udpHeader
 	udpHeader[0] = 0x80
@@ -759,11 +835,30 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
 		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
-		// encrypt the opus data
-		copy(nonce[:], udpHeader)
-		v.RLock()
-		sendbuf := secretbox.Seal(udpHeader, recvbuf, &nonce, &v.op4.SecretKey)
-		v.RUnlock()
+		// DAVE E2EE encryption: encrypt the Opus frame before transport encryption
+		audioData := recvbuf
+		if v.DaveSession != nil {
+			maxSize := v.DaveSession.MaxEncryptedFrameSize(len(recvbuf))
+			if cap(v.daveEncryptBuf) < maxSize {
+				v.daveEncryptBuf = make([]byte, maxSize)
+			}
+			n, daveErr := v.DaveSession.Encrypt(v.op2.SSRC, recvbuf, v.daveEncryptBuf[:maxSize])
+			if daveErr != nil {
+				v.log(LogError, "DAVE encrypt error: %s", daveErr)
+				// Fall through with unencrypted frame (passthrough mode handles this)
+			} else {
+				audioData = v.daveEncryptBuf[:n]
+			}
+		}
+
+		// Transport encryption: AES-256-GCM
+		// add incrementing nonce counter as per discord's requirements
+		binary.LittleEndian.PutUint32(nonce[:4], v.nonceCounter)
+		v.nonceCounter++
+
+		sendbuf := v.aead.Seal(nil, nonce, audioData, udpHeader)
+		sendbuf = append(sendbuf, nonce[:4]...) // 4 byte nonce to ciphertext appended
+		sendbuf = append(udpHeader, sendbuf...) // final
 
 		// block here until we're exactly at the right time :)
 		// Then send rtp audio packet to Discord over UDP
@@ -814,8 +909,8 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		return
 	}
 
-	recvbuf := make([]byte, 1024)
-	var nonce [24]byte
+	recvbuf := make([]byte, 2048)
+	var nonce [12]byte
 
 	for {
 		rlen, err := udpConn.Read(recvbuf)
@@ -843,8 +938,9 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			// continue loop
 		}
 
-		// For now, skip anything except audio.
-		if rlen < 12 || (recvbuf[0] != 0x80 && recvbuf[0] != 0x90) {
+		// For now, skip anything except RTP v2 packets (audio).
+		// RTP v2 => top two bits are 10 (0x80).
+		if rlen < 12 || (recvbuf[0]&0xC0) != 0x80 {
 			continue
 		}
 
@@ -854,24 +950,60 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 		p.Sequence = binary.BigEndian.Uint16(recvbuf[2:4])
 		p.Timestamp = binary.BigEndian.Uint32(recvbuf[4:8])
 		p.SSRC = binary.BigEndian.Uint32(recvbuf[8:12])
-		// decrypt opus data
-		copy(nonce[:], recvbuf[0:12])
 
-		if opus, ok := secretbox.Open(nil, recvbuf[12:rlen], &nonce, &v.op4.SecretKey); ok {
-			p.Opus = opus
-		} else {
+		// RTP header parsing for *_rtpsize AEAD modes:
+		// - base RTP header is 12 bytes + 4 bytes per CSRC (CC).
+		// - if extension bit (X) is set, ONLY the 4-byte extension preamble is unencrypted/AAD;
+		//   the extension payload is encrypted and must be stripped after decryption.
+		cc := int(recvbuf[0] & 0x0F)
+		hasExt := (recvbuf[0] & 0x10) != 0
+
+		baseHeaderLen := 12 + (4 * cc)
+		if rlen < baseHeaderLen {
 			continue
 		}
 
-		// extension bit set, and not a RTCP packet
-		if ((recvbuf[0] & 0x10) == 0x10) && ((recvbuf[1] & 0x80) == 0) {
-			// get extended header length
-			extlen := binary.BigEndian.Uint16(p.Opus[2:4])
-			// 4 bytes (ext header header) + 4*extlen (ext header data)
-			shift := int(4 + 4*extlen)
-			if len(p.Opus) > shift {
-				p.Opus = p.Opus[shift:]
+		aadLen := baseHeaderLen
+		extPayloadBytes := 0
+		if hasExt {
+			if rlen < baseHeaderLen+4 {
+				continue
 			}
+			// Extension length is in 32-bit words at the end of the extension preamble.
+			extLenWords := int(binary.BigEndian.Uint16(recvbuf[baseHeaderLen+2 : baseHeaderLen+4]))
+			extPayloadBytes = extLenWords * 4
+			aadLen = baseHeaderLen + 4
+		}
+
+		if rlen < aadLen+4 {
+			continue
+		}
+
+		// decrypt opus data
+		payload := recvbuf[aadLen:rlen]
+		if len(payload) < 4 {
+			continue
+		}
+		nonceCounter := payload[len(payload)-4:]
+		cipherTextPayload := payload[:len(payload)-4]
+
+		binary.LittleEndian.PutUint32(nonce[:4], binary.LittleEndian.Uint32(nonceCounter))
+
+		if v.aead == nil {
+			continue
+		}
+		// AAD must cover the unencrypted header portion.
+		if plain, err := v.aead.Open(nil, nonce[:], cipherTextPayload, recvbuf[:aadLen]); err == nil {
+			// If header extensions are present, strip decrypted extension payload to get to Opus.
+			if extPayloadBytes > 0 {
+				if len(plain) < extPayloadBytes {
+					continue
+				}
+				plain = plain[extPayloadBytes:]
+			}
+			p.Opus = plain
+		} else {
+			continue
 		}
 
 		if c != nil {

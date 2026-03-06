@@ -87,6 +87,11 @@ type Session struct {
 	// Whether the UDP Connection is ready
 	UDPReady bool // NOTE: Deprecated
 
+	// DaveSessionCreate is a factory function that creates a DAVE E2EE session
+	// for a new voice connection. If nil, DAVE is not used.
+	// Set this before calling ChannelVoiceJoin to enable DAVE E2EE.
+	DaveSessionCreate DaveSessionCreateFunc
+
 	// Stores a mapping of guild id's to VoiceConnections
 	VoiceConnections map[string]*VoiceConnection
 
@@ -2621,6 +2626,24 @@ type EntitlementFilterOptions struct {
 	ExcludeEnded bool
 }
 
+// MessagePin contains information about a pinned message, and the message itself
+type MessagePin struct {
+	// The time the message was pinned
+	PinnedAt time.Time `json:"pinned_at"`
+
+	// The message object which was pinned
+	Message *Message `json:"message"`
+}
+
+// ChannelMessagePinsList contains a list of pinned messages in a channel
+type ChannelMessagePinsList struct {
+	// The list of pinned messages
+	Items []*MessagePin `json:"items"`
+
+	// Whether there are more items available to fetch
+	HasMore bool `json:"has_more"`
+}
+
 // Constants for the different bit offsets of text channel permissions
 const (
 	// Deprecated: PermissionReadMessages has been replaced with PermissionViewChannel for text and voice channels
@@ -2864,6 +2887,7 @@ const (
 	ErrCodeUnknownSticker                        = 10060
 	ErrCodeUnknownInteraction                    = 10062
 	ErrCodeUnknownApplicationCommand             = 10063
+	ErrCodeUnknownVoiceState                     = 10065
 	ErrCodeUnknownApplicationCommandPermissions  = 10066
 	ErrCodeUnknownStageInstance                  = 10067
 	ErrCodeUnknownGuildMemberVerificationForm    = 10068
