@@ -139,6 +139,11 @@ func (v *VoiceConnection) ChangeChannel(channelID string, mute, deaf bool) (err 
 		return
 	}
 	v.ChannelID = channelID
+	if v.DaveSession != nil {
+		if cID, err := strconv.ParseUint(channelID, 10, 64); err == nil {
+			v.DaveSession.SetChannelID(cID)
+		}
+	}
 	v.deaf = deaf
 	v.mute = mute
 	v.speaking = false
@@ -482,14 +487,14 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		// TODO: Should we allow 48000/960 values to be user defined?
 		// answer: no, 48k is required as per discord documentaiton and 960 is the most optimal frame size (based on testing)
 		if v.OpusSend == nil {
-			v.OpusSend = make(chan []byte, 2)
+			v.OpusSend = make(chan []byte, 100)
 		}
 		go v.opusSender(v.udpConn, v.close, v.OpusSend, 48000, 960)
 
 		// Start the opusReceiver
 		if !v.deaf {
 			if v.OpusRecv == nil {
-				v.OpusRecv = make(chan *Packet, 2)
+				v.OpusRecv = make(chan *Packet, 100)
 			}
 
 			go v.opusReceiver(v.udpConn, v.close, v.OpusRecv)
